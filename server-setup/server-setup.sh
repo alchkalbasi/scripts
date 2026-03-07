@@ -113,6 +113,7 @@ if [[ "$RUN_STEP_4" == "Y" || "$RUN_STEP_4" == "y" ]]; then
     chmod 700 "$SSH_DIR"
     chown "$SCRIPT_USER":"$SCRIPT_USER" "$SSH_DIR"
     touch $AUTH_KEYS
+    chown "$SCRIPT_USER":"$SCRIPT_USER" "$AUTH_KEYS"
 
     echo "Enter SSH public keys one by one. Type 'done' when finished."
     while true; do
@@ -200,6 +201,9 @@ if [[ "$RUN_STEP_6" == "Y" || "$RUN_STEP_6" == "y" ]]; then
     echo "Allow SSH port"
     iptables -A INPUT -p tcp --dport $PORT -j ACCEPT
 
+    echo "Allow ICMP (ping)..."
+    iptables -A INPUT -p icmp -j ACCEPT
+
     echo "Configuring Docker forwarding rules..."
     iptables -A FORWARD -i docker0 -o docker0 -j $IPTABLES_DOCKER_FORWARD
     iptables -A FORWARD -i docker0 ! -o docker0 -j $IPTABLES_DOCKER_FORWARD
@@ -232,6 +236,30 @@ elif [[ "$INSTALL_DOCKER" == "N" || "$INSTALL_DOCKER" == "n" ]]; then
     echo "Skipping Docker installation"
 else
     echo "Incorrect option, please enter Y(es) or N(o)"
+fi
+
+printf '\n\n\n'
+
+# ****************************** STEP 8 ******************************
+echo "****************************** Disable ip.v6 ******************************"
+printf '\n'
+read -rp "Do you want to disable IP.v6 with sysctl?' (Y or N)? " RUN_STEP_8
+
+if [[ "$RUN_STEP_8" == "Y" || "$RUN_STEP_8" == "y" ]]; then
+	mkdir -p /etc/sysctl.d
+	touch /etc/sysctl.d/99-disable-ipv6.conf
+	tee -a "/etc/sysctl.d/99-disable-ipv6.conf" > /dev/null <<EOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+	#apply changes	
+	sysctl --system
+
+elif [[ "$RUN_STEP_8" == "N" || "$RUN_STEP_8" == "n" ]]; then
+    echo "Skipping Step 8..."
+else
+    echo "Incorrect option, skipping Step 8..."
 fi
 
 echo "****************************** Finished ******************************"
