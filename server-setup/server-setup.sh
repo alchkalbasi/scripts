@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# This script sets up base configs for a Debian server.
+
+###########################################################################
+# Script Name	: server-setup                                            #
+# Description	: This script sets up base configs for a Debian server    #
+# Author       	: Ali Kalbasi                                             #
+# Email         : ali9kalbasi@gmail.com                                   #
+###########################################################################
 
 # Variables
 source .env
@@ -10,10 +16,19 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# functions
+function aptupdate {
+    echo "apt-get update..."
+    apt-get update > /dev/null
+    echo "apt-get upgrade..."
+    apt-get upgrade > /dev/null
+}
+
 # ****************************** STEP 1 ******************************
 echo "****************************** Updating apt source list ******************************"
 printf '\n'
-read -rp "Do you want to update apt source list (Y or N)? " RUN_STEP_1
+read -rp "Do you want to update apt source list ([Y] or N)? " RUN_STEP_1
+RUN_STEP_1=${RUN_STEP_1:-Y}
 
 if [[ "$RUN_STEP_1" == "Y" || "$RUN_STEP_1" == "y" ]]; then
     echo "Updating apt default source list..."
@@ -32,9 +47,8 @@ EOF
     tee -a "$APT_TARGET" > /dev/null <<EOF
 deb $APT_SECURITY_URL ${DEBIAN_CODENAME}-security $APT_COMPONENTS
 EOF
-
-    echo "apt-get update..."
-    apt-get update > /dev/null
+    # call update and upgrade function
+    aptupdate
 
 elif [[ "$RUN_STEP_1" == "N" || "$RUN_STEP_1" == "n" ]]; then
     echo "Skipping Step 1..."
@@ -47,10 +61,14 @@ printf '\n\n\n'
 # ****************************** STEP 2 ******************************
 echo "****************************** Install some packages ******************************"
 printf '\n'
-read -rp "Do you want to install base packages (Y or N)? " RUN_STEP_2
+read -rp "Do you want to install base packages ([Y] or N)? " RUN_STEP_2
+RUN_STEP_2=${RUN_STEP_2:-Y}
 
 if [[ "$RUN_STEP_2" == "Y" || "$RUN_STEP_2" == "y" ]]; then
     FAILED_PACKAGES=()
+    
+    # call update and upgrade function
+    aptupdate
 
     if [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
         for pkg in "${PACKAGES_TO_INSTALL[@]}"; do
@@ -78,7 +96,8 @@ printf '\n\n\n'
 # ****************************** STEP 3 ******************************
 echo "****************************** Configure Passwordless Sudo ******************************"
 printf '\n'
-read -rp "Do you want to enable passwordless sudo for user '$SCRIPT_USER' (Y or N)? " RUN_STEP_3
+read -rp "Do you want to enable passwordless sudo for user '$SCRIPT_USER' ([Y] or N)? " RUN_STEP_3
+RUN_STEP_3=${RUN_STEP_3:-Y}
 
 if [[ "$RUN_STEP_3" == "Y" || "$RUN_STEP_3" == "y" ]]; then
 
@@ -105,11 +124,12 @@ printf '\n\n\n'
 # ****************************** STEP 4 ******************************
 echo "****************************** Add SSH key ******************************"
 printf '\n'
-read -rp "Do you want to add SSH keys (Y or N)? " RUN_STEP_4
+read -rp "Do you want to add SSH keys ([Y]or N)? " RUN_STEP_4
+RUN_STEP_4=${RUN_STEP_4:-Y}
 
 if [[ "$RUN_STEP_4" == "Y" || "$RUN_STEP_4" == "y" ]]; then
     echo "Create .ssh directory if it doesn't exist"
-    mkdir -p "$SSH_DIR"
+    [ -d $SSH_DIR ] && echo ".ssh directory is exist" || mkdir -p "$SSH_DIR"
     chmod 700 "$SSH_DIR"
     chown "$SCRIPT_USER":"$SCRIPT_USER" "$SSH_DIR"
     touch $AUTH_KEYS
@@ -143,7 +163,8 @@ printf '\n\n\n'
 # ****************************** STEP 5 ******************************
 echo "****************************** sshd config hardening ******************************"
 printf '\n'
-read -rp "Do you want to update sshd config (Y or N)? " RUN_STEP_5
+read -rp "Do you want to update sshd config ([Y] or N)? " RUN_STEP_5
+RUN_STEP_5=${RUN_STEP_5:-Y}
 
 if [[ "$RUN_STEP_5" == "Y" || "$RUN_STEP_5" == "y" ]]; then
     cp "$SSHD_CONFIG" "$BACKUP_SSHD"
@@ -179,7 +200,8 @@ printf '\n\n\n'
 # ****************************** STEP 6 ******************************
 echo "****************************** Set iptables ******************************"
 printf '\n'
-read -rp "Do you want to configure iptables (Y or N)? " RUN_STEP_6
+read -rp "Do you want to configure iptables ([Y] or N)? " RUN_STEP_6
+RUN_STEP_6=${RUN_STEP_6:-Y}
 
 if [[ "$RUN_STEP_6" == "Y" || "$RUN_STEP_6" == "y" ]]; then
     echo "Seting default policies..."
@@ -227,12 +249,13 @@ printf '\n\n\n'
 # ****************************** STEP 7 ******************************
 echo "****************************** Install docker ******************************"
 printf '\n'
-read -rp "Do you want to install Docker (Y or N)? " INSTALL_DOCKER
+read -rp "Do you want to install Docker ([Y] or N)? " RUN_STEP_7
+RUN_STEP_7=${RUN_STEP_7:-Y}
 
-if [[ "$INSTALL_DOCKER" == "Y" || "$INSTALL_DOCKER" == "y" ]]; then
+if [[ "$RUN_STEP_7" == "Y" || "$RUN_STEP_7" == "y" ]]; then
     echo "Sourcing Docker install script..."
     source ./docker-install.sh
-elif [[ "$INSTALL_DOCKER" == "N" || "$INSTALL_DOCKER" == "n" ]]; then
+elif [[ "$RUN_STEP_7" == "N" || "$RUN_STEP_7" == "n" ]]; then
     echo "Skipping Docker installation"
 else
     echo "Incorrect option, please enter Y(es) or N(o)"
@@ -243,12 +266,13 @@ printf '\n\n\n'
 # ****************************** STEP 8 ******************************
 echo "****************************** Disable ip.v6 ******************************"
 printf '\n'
-read -rp "Do you want to disable IP.v6 with sysctl?' (Y or N)? " RUN_STEP_8
+read -rp "Do you want to disable IP.v6 with sysctl?' ([Y] or N)? " RUN_STEP_8
+RUN_STEP_8=${RUN_STEP_8:-Y}
 
 if [[ "$RUN_STEP_8" == "Y" || "$RUN_STEP_8" == "y" ]]; then
 	mkdir -p /etc/sysctl.d
 	touch /etc/sysctl.d/99-disable-ipv6.conf
-	tee -a "/etc/sysctl.d/99-disable-ipv6.conf" > /dev/null <<EOF
+	tee -a "/etc/sysctl.d/99-disable-ipv6.conf" > /dev/null << EOF
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
@@ -262,5 +286,40 @@ else
     echo "Incorrect option, skipping Step 8..."
 fi
 
+printf '\n\n\n'
+
+# ****************************** STEP 9 ******************************
+echo "****************************** Create workspace directory ******************************"
+printf '\n'
+read -rp "Do you want to create 'workspace' dir ([Y] or N)? " RUN_STEP_9
+RUN_STEP_9=${RUN_STEP_9:-Y}
+
+if [[ "RUN_STEP_9" == "Y" || "$RUN_STEP_9" == "y" ]]; then
+    [ -d /home/$SCRIPT_USER/workspace ] && echo "workspace directory is exist" || mkdir -p "/home/$SCRIPT_USER/workspace"
+elif [[ "$RUN_STEP_9" == "N" || "$RUN_STEP_9" == "n" ]]; then
+    echo "Skipping Step 9..."
+else
+    echo "Incorrect option, skipping Step 9..."
+fi
+
+printf '\n\n\n'
+
 echo "****************************** Finished ******************************"
 printf '\n'
+
+echo "Are you happy with this script?"
+select HAPPY in Happy Unhappy
+do
+    case $HAPPY in
+        Happy)
+            echo "You're Welcome"
+            ;;
+        Unhappy)
+            echo "Go use another script."
+            ;;
+        *)
+            echo "Idiot! Choose correct option."
+            ;;
+    break
+    esac
+done
