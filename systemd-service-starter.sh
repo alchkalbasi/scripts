@@ -9,7 +9,15 @@
 
 # Variables
 SERVICES=(
-    docker.service
+    tirex.service
+    tirex.socket
+    tirex-delivery.service
+    tirex-mule.service
+    grimstroke.service
+    grimstroke.socket
+    grimstroke-celery.service
+    clinkz.service
+    clinkz.socket
 )
 
 # functions
@@ -19,7 +27,7 @@ service_health() {
 
 # main
 for SERVICE in "${SERVICES[@]}"; do
-    if [[ $(service_health "$SERVICE") == "inactive" ]]; then
+    if [[ $(service_health "$SERVICE") == "inactive" || $(service_health "$SERVICE") == "failed" ]]; then
         systemctl start "$SERVICE"
     fi
 done
