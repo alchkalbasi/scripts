@@ -8,17 +8,7 @@
 ###########################################################################
 
 # Variables
-SERVICES=(
-    tirex.service
-    tirex.socket
-    tirex-delivery.service
-    tirex-mule.service
-    grimstroke.service
-    grimstroke.socket
-    grimstroke-celery.service
-    clinkz.service
-    clinkz.socket
-)
+source .env
 
 # functions
 service_health() {
