@@ -1,5 +1,6 @@
 repo.list
 .env
+server-setup/.env
 ping-proxy.sh
 ping-simserver.sh
 ping-asiatech.sh

@@ -1,65 +1,70 @@
-# Debian Server Base Setup Script
+# Debian Server Setup
 
-This Bash script automates the initial setup and hardening of a Debian server. It performs common tasks such as updating apt sources, installing packages, configuring SSH, setting up iptables, and optionally installing Docker.
+`server-setup.sh` performs an interactive, nine-step Debian server setup with package-install progress percentages, validation, persistent logging, and configurable defaults.
 
-## Features
+## Setup steps
 
-The script is designed to be **fully interactive**, asking for confirmation before executing each of the following 7 steps:
+1. Configure APT sources and optionally upgrade packages.
+2. Install base packages and `iptables-persistent`.
+3. Configure validated passwordless sudo.
+4. Initialize `authorized_keys` and add configured or interactive SSH keys.
+5. Stage, validate, back up, and reload the SSH configuration.
+6. Add idempotent iptables rules before enabling restrictive policies.
+7. Install Docker Engine from a configured APT repository.
+8. Optionally disable IPv6 using an idempotent sysctl file.
+9. Create a user-owned workspace directory.
 
-1.  **Update APT sources** Configures default, updates, backports, and security repositories.
+Command output is written to `/var/log/server-setup.log` by default. A failed SSH reload restores the previous configuration, and firewall allow rules are installed before restrictive policies to reduce lockout risk.
 
-2.  **Install essential packages** Installs a predefined list of packages from `.env`, including `iptables-persistent`.
+## Usage
 
-3.  **Configure Passwordless Sudo** Enables `NOPASSWD` sudo access for the user defined in `.env` by creating a safe configuration in `/etc/sudoers.d/`.
-
-4.  **SSH key management** Creates `.ssh` directory, interactively prompts to add multiple SSH public keys, and prevents duplicates.
-
-5.  **SSHD hardening** Updates `sshd_config` to enforce security best practices (disable root login, set port, configure authentication methods, etc.) and restarts the SSH service.
-
-6.  **Firewall setup with iptables** Configures default policies (`INPUT`, `FORWARD`, `OUTPUT`), allows specific ports, loopback, established connections, and saves the rules using `netfilter-persistent` or `iptables-save`.
-
-7.  **Optional Docker installation** Prompts the user to install **Docker Engine** by sourcing a separate script (`docker-install.sh`), which includes adding the GPG key, setting up the repository, installing core Docker packages, enabling the service, and adding the user to the `docker` group.
-
----
-
-## Prerequisites
-
--   Debian-based server
--   Run as **root** (`sudo`)
--   `.env` file containing required variables:
+Create the local configuration from the example and adjust it for the server:
 
 ```bash
-APT_TARGET=
-APT_URL=
-APT_SECURITY_URL=
-DEBIAN_CODENAME=
-APT_COMPONENTS=
-PACKAGES_TO_INSTALL=()
-SCRIPT_USER=
-SSH_DIR=
-AUTH_KEYS=
-SSHD_CONFIG=
-BACKUP_SSHD=
-PORT=
-PERMIT_ROOT_LOGIN=
-MAX_AUTH_TRIES=
-PUBKEY_AUTH=
-PASSWORD_AUTH=
-EMPTY_PASS=
-KBD_INTERACTIVE_AUTH=
-KERBEROS_AUTH=
-GSS_AUTH=
-USE_PAM=
-X11_FORWARDING=
-PRINT_MOTD=
-IPTABLES_INPUT=
-IPTABLES_FORWARD=
-IPTABLES_OUTPUT=
-IPTABLES_ALLOW_PORTS=()
-IPT_PERSISTENT=
+cp .env.example .env
+sudo ./server-setup.sh
+```
 
-# Docker-specific variables (used in docker-install.sh)
-GPG_URL=
-ARCH=
-DOCKER_SOURCE_LIST_URL=
-DOCKER_SOURCE_LIST_COMPONENT=
+Options:
+
+```text
+-e, --env FILE         Load another configuration file
+-y, --yes              Run every step without confirmation
+-n, --non-interactive  Use each step's configured default answer
+-h, --help             Show help
+```
+
+The script resolves `.env` and `docker-install.sh` relative to its own directory, so it can be launched from any working directory.
+
+## Configuration
+
+`.env` is Bash syntax. Arrays must use Bash array syntax, for example:
+
+```bash
+PACKAGES_TO_INSTALL=(curl git htop)
+IPTABLES_ALLOW_PORTS=(80 443)
+SSH_PUBLIC_KEYS=(
+    "ssh-ed25519 AAAA... admin@example"
+)
+```
+
+The main behavior switches are:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APT_RUN_UPGRADE` | `true` | Upgrade installed packages after changing sources |
+| `APT_INSTALL_RECOMMENDS` | `false` | Install APT recommended packages |
+| `APT_ENABLE_BACKPORTS` | `true` | Add the Debian backports source |
+| `APT_ENABLE_PROPOSED` | `false` | Add proposed updates; normally leave disabled on production servers |
+| `ALLOW_SSH_LOCKOUT` | `false` | Permit password auth to be disabled without a configured public key |
+| `SERVER_SETUP_LOG` | `/var/log/server-setup.log` | Detailed command log |
+| `WORKSPACE_DIR` | `/home/$SCRIPT_USER/workspace` | Workspace destination |
+
+Each step has a `STEP_*_DEFAULT` variable containing `Y` or `N`. Passwordless sudo and IPv6 disabling default to `N`; see `.env.example` for the full list.
+
+## Safety notes
+
+- Keep an existing root or console session open while applying SSH and firewall changes.
+- Put the selected SSH port in `PORT`; it is automatically allowed by the firewall step.
+- Review mirror URLs and the Docker GPG URL before running the script as root.
+- `--yes` opts into every step, including passwordless sudo and disabling IPv6.

@@ -1,325 +1,551 @@
 #!/usr/bin/env bash
 
-###########################################################################
-# Script Name	: server-setup                                            #
-# Description	: This script sets up base configs for a Debian server    #
-# Author       	: Ali Kalbasi                                             #
-# Email         : ali9kalbasi@gmail.com                                   #
-###########################################################################
+set -Eeo pipefail
+umask 022
 
-# Variables
-source .env
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TOTAL_STEPS=9
 
-# Check for root
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root (sudo)." >&2
-    exit 1
-fi
+ENV_FILE="${SERVER_SETUP_ENV:-$SCRIPT_DIR/.env}"
+ASSUME_YES=false
+NON_INTERACTIVE=false
+COMPLETED_STEPS=0
+CURRENT_STEP="initialization"
+START_SECONDS=$SECONDS
+APT_INDEX_REFRESHED=false
 
-# functions
-function aptupdate {
-    echo "apt-get update..."
-    apt-get update > /dev/null
-    echo "apt-get upgrade..."
-    apt-get upgrade > /dev/null
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Set up and harden a Debian server interactively.
+
+Options:
+  -e, --env FILE         Load configuration from FILE (default: $SCRIPT_DIR/.env)
+  -y, --yes              Answer yes to every step
+  -n, --non-interactive  Use each step's configured default answer
+  -h, --help             Show this help text
+EOF
 }
 
-# ****************************** STEP 1 ******************************
-echo "****************************** Updating apt source list ******************************"
-printf '\n'
-read -rp "Do you want to update apt source list ([Y] or N)? " RUN_STEP_1
-RUN_STEP_1=${RUN_STEP_1:-Y}
+while (($# > 0)); do
+    case "$1" in
+        -e|--env)
+            [[ $# -ge 2 ]] || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
+            ENV_FILE=$2
+            shift 2
+            ;;
+        -y|--yes)
+            ASSUME_YES=true
+            shift
+            ;;
+        -n|--non-interactive)
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
-if [[ "$RUN_STEP_1" == "Y" || "$RUN_STEP_1" == "y" ]]; then
-    echo "Updating apt default source list..."
-    tee "$APT_TARGET" > /dev/null <<EOF
-deb $APT_URL $DEBIAN_CODENAME $APT_COMPONENTS
-EOF
+[[ $EUID -eq 0 ]] || { printf 'This script must be run as root (sudo).\n' >&2; exit 1; }
+[[ -r $ENV_FILE ]] || { printf 'Configuration file is not readable: %s\n' "$ENV_FILE" >&2; exit 1; }
 
-    tee -a "$APT_TARGET" > /dev/null <<EOF
-deb $APT_URL ${DEBIAN_CODENAME}-updates $APT_COMPONENTS
-deb $APT_URL ${DEBIAN_CODENAME}-proposed-updates $APT_COMPONENTS
-deb $APT_URL ${DEBIAN_CODENAME}-backports $APT_COMPONENTS
-EOF
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+set -u
 
-    # Apt security source list
-    echo "Updating apt security source list..."
-    tee -a "$APT_TARGET" > /dev/null <<EOF
-deb $APT_SECURITY_URL ${DEBIAN_CODENAME}-security $APT_COMPONENTS
-EOF
-    # call update and upgrade function
-    aptupdate
+# Derived paths are computed here so config variable order cannot corrupt them.
+SCRIPT_USER="${SCRIPT_USER:-${SUDO_USER:-}}"
+REPO_NAME="${REPO_NAME:-debian}"
+if [[ ${APT_TARGET:-} == /etc/apt/sources.list.d/.list ]]; then
+    unset APT_TARGET
+fi
+APT_TARGET="${APT_TARGET:-/etc/apt/sources.list.d/${REPO_NAME}.list}"
+SUDOERS_FILE="${SUDOERS_FILE:-/etc/sudoers.d/${SCRIPT_USER}}"
+SSH_DIR="${SSH_DIR:-/home/${SCRIPT_USER}/.ssh}"
+AUTH_KEYS="${AUTH_KEYS:-${SSH_DIR}/authorized_keys}"
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+BACKUP_SSHD="${BACKUP_SSHD:-${SSHD_CONFIG}.server-setup.bak}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-/home/${SCRIPT_USER}/workspace}"
+LOG_FILE="${SERVER_SETUP_LOG:-/var/log/server-setup.log}"
 
-elif [[ "$RUN_STEP_1" == "N" || "$RUN_STEP_1" == "n" ]]; then
-    echo "Skipping Step 1..."
-else
-    echo "Incorrect option, skipping Step 1..."
+APT_RUN_UPGRADE="${APT_RUN_UPGRADE:-true}"
+APT_INSTALL_RECOMMENDS="${APT_INSTALL_RECOMMENDS:-false}"
+APT_ENABLE_BACKPORTS="${APT_ENABLE_BACKPORTS:-true}"
+APT_ENABLE_PROPOSED="${APT_ENABLE_PROPOSED:-false}"
+ALLOW_SSH_LOCKOUT="${ALLOW_SSH_LOCKOUT:-false}"
+WORKSPACE_MODE="${WORKSPACE_MODE:-0755}"
+
+STEP_APT_SOURCES_DEFAULT="${STEP_APT_SOURCES_DEFAULT:-Y}"
+STEP_PACKAGES_DEFAULT="${STEP_PACKAGES_DEFAULT:-Y}"
+STEP_PASSWORDLESS_SUDO_DEFAULT="${STEP_PASSWORDLESS_SUDO_DEFAULT:-N}"
+STEP_SSH_KEYS_DEFAULT="${STEP_SSH_KEYS_DEFAULT:-Y}"
+STEP_SSH_HARDENING_DEFAULT="${STEP_SSH_HARDENING_DEFAULT:-Y}"
+STEP_FIREWALL_DEFAULT="${STEP_FIREWALL_DEFAULT:-Y}"
+STEP_DOCKER_DEFAULT="${STEP_DOCKER_DEFAULT:-Y}"
+STEP_DISABLE_IPV6_DEFAULT="${STEP_DISABLE_IPV6_DEFAULT:-N}"
+STEP_WORKSPACE_DEFAULT="${STEP_WORKSPACE_DEFAULT:-Y}"
+
+if ! declare -p PACKAGES_TO_INSTALL &>/dev/null; then
+    PACKAGES_TO_INSTALL=()
+fi
+if ! declare -p IPTABLES_ALLOW_PORTS &>/dev/null; then
+    IPTABLES_ALLOW_PORTS=()
+fi
+if ! declare -p SSH_PUBLIC_KEYS &>/dev/null; then
+    SSH_PUBLIC_KEYS=()
 fi
 
-printf '\n\n\n'
+mkdir -p -- "$(dirname -- "$LOG_FILE")"
+touch -- "$LOG_FILE"
+chmod 0600 "$LOG_FILE"
+exec 3>>"$LOG_FILE"
 
-# ****************************** STEP 2 ******************************
-echo "****************************** Install some packages ******************************"
-printf '\n'
-read -rp "Do you want to install base packages ([Y] or N)? " RUN_STEP_2
-RUN_STEP_2=${RUN_STEP_2:-Y}
+log() {
+    printf '%s\n' "$*"
+    printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*" >&3
+}
 
-if [[ "$RUN_STEP_2" == "Y" || "$RUN_STEP_2" == "y" ]]; then
-    FAILED_PACKAGES=()
-    
-    # call update and upgrade function
-    aptupdate
+warn() {
+    log "WARNING: $*"
+}
 
-    if [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
-        for pkg in "${PACKAGES_TO_INSTALL[@]}"; do
-            if apt-get install -y "$pkg" > /dev/null 2>&1; then
-                echo "✓ Installed: $pkg"
-            else
-                echo "✗ FAILED: $pkg"
-                FAILED_PACKAGES+=("$pkg")
-            fi
-        done
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+on_error() {
+    local status=$?
+    local line=$1
+    log "ERROR: Step '$CURRENT_STEP' failed at line $line (exit $status)."
+    log "Review the log for command output: $LOG_FILE"
+    exit "$status"
+}
+trap 'on_error "$LINENO"' ERR
+
+run_logged() {
+    local description=$1
+    shift
+    log "$description"
+    if "$@" >>"$LOG_FILE" 2>&1; then
+        return 0
+    else
+        local status=$?
+        log "ERROR: $description failed (exit $status). Last log lines:"
+        tail -n 15 "$LOG_FILE"
+        return "$status"
+    fi
+}
+
+require_vars() {
+    local name
+    for name in "$@"; do
+        [[ -n ${!name:-} ]] || die "Required configuration variable '$name' is empty."
+    done
+}
+
+require_commands() {
+    local command_name
+    for command_name in "$@"; do
+        command -v "$command_name" >/dev/null 2>&1 || die "Required command is unavailable: $command_name"
+    done
+}
+
+validate_boolean() {
+    local name=$1
+    case "${!name,,}" in
+        true|false|yes|no|1|0) ;;
+        *) die "$name must be true or false (current value: ${!name})." ;;
+    esac
+}
+
+is_true() {
+    case "${1,,}" in
+        true|yes|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+confirm() {
+    local prompt=$1
+    local default=${2^^}
+    local answer
+
+    [[ $default == Y || $default == N ]] || die "Invalid prompt default '$2' for: $prompt"
+    if $ASSUME_YES; then
+        log "$prompt [yes: --yes]"
+        return 0
+    fi
+    if $NON_INTERACTIVE || [[ ! -t 0 ]]; then
+        log "$prompt [${default,,}: configured default]"
+        [[ $default == Y ]]
+        return
     fi
 
-    echo "iptables-persistent iptables-persistent/autosave_v4 boolean $IPT_PERSISTENT" | debconf-set-selections
-    echo "iptables-persistent iptables-persistent/autosave_v6 boolean $IPT_PERSISTENT" | debconf-set-selections
-    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent > /dev/null 2>&1
-
-elif [[ "$RUN_STEP_2" == "N" || "$RUN_STEP_2" == "n" ]]; then
-    echo "Skipping Step 2..."
-else
-    echo "Incorrect option, skipping Step 2..."
-fi
-
-printf '\n\n\n'
-
-# ****************************** STEP 3 ******************************
-echo "****************************** Configure Passwordless Sudo ******************************"
-printf '\n'
-read -rp "Do you want to enable passwordless sudo for user '$SCRIPT_USER' ([Y] or N)? " RUN_STEP_3
-RUN_STEP_3=${RUN_STEP_3:-Y}
-
-if [[ "$RUN_STEP_3" == "Y" || "$RUN_STEP_3" == "y" ]]; then
-
-    # Backup existing sudoers file if it exists
-    if [[ -f "$SUDOERS_FILE" ]]; then
-        cp "$SUDOERS_FILE" "${SUDOERS_FILE}.bak"
-        echo "Existing sudoers file backed up to ${SUDOERS_FILE}.bak"
-    fi
-
-    # Write passwordless sudo entry safely
-    echo "$SCRIPT_USER ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
-    chmod 0440 "$SUDOERS_FILE"
-
-    echo "Passwordless sudo enabled for user $SCRIPT_USER."
-
-elif [[ "$RUN_STEP_3" == "N" || "$RUN_STEP_3" == "n" ]]; then
-    echo "Skipping Step 3..."
-else
-    echo "Incorrect option, skipping Step 3..."
-fi
-
-printf '\n\n\n'
-
-# ****************************** STEP 4 ******************************
-echo "****************************** Add SSH key ******************************"
-printf '\n'
-read -rp "Do you want to add SSH keys ([Y]or N)? " RUN_STEP_4
-RUN_STEP_4=${RUN_STEP_4:-Y}
-
-if [[ "$RUN_STEP_4" == "Y" || "$RUN_STEP_4" == "y" ]]; then
-    echo "Create .ssh directory if it doesn't exist"
-    [ -d $SSH_DIR ] && echo ".ssh directory is exist" || mkdir -p "$SSH_DIR"
-    chmod 700 "$SSH_DIR"
-    chown "$SCRIPT_USER":"$SCRIPT_USER" "$SSH_DIR"
-    touch $AUTH_KEYS
-    chown "$SCRIPT_USER":"$SCRIPT_USER" "$AUTH_KEYS"
-
-    echo "Enter SSH public keys one by one. Type 'done' when finished."
     while true; do
-        read -rp "Enter SSH key: " key
-        [[ "$key" == "done" ]] && break  # stop loop
-
-        # Skip empty lines
-        [[ -z "$key" ]] && continue
-
-        # Check for duplicates
-        if ! grep -qxF "$key" "$AUTH_KEYS" 2>/dev/null; then
-            echo "$key" >> "$AUTH_KEYS"
-            echo "Key added."
+        if [[ $default == Y ]]; then
+            read -r -p "$prompt [Y/n] " answer
         else
-            echo "Key already exists, skipping..."
+            read -r -p "$prompt [y/N] " answer
+        fi
+        answer=${answer:-$default}
+        case "${answer,,}" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+            *) log "Please answer yes or no." ;;
+        esac
+    done
+}
+
+run_step() {
+    local label=$1
+    local prompt=$2
+    local default=$3
+    local function_name=$4
+    local step_number=$((COMPLETED_STEPS + 1))
+    local result
+
+    CURRENT_STEP=$label
+    printf '\nStep %d/%d: %s\n' "$step_number" "$TOTAL_STEPS" "$label"
+    if confirm "$prompt" "$default"; then
+        "$function_name"
+        result="completed"
+    else
+        result="skipped"
+    fi
+
+    COMPLETED_STEPS=$step_number
+    printf 'Step %d/%d %s: %s\n' "$step_number" "$TOTAL_STEPS" "$result" "$label"
+}
+
+show_subprogress() {
+    local current=$1 total=$2 label=$3
+    local percent=$((current * 100 / total))
+    printf '[%3d%%] %s (%d/%d)\n' "$percent" "$label" "$current" "$total"
+}
+
+validate_config() {
+    [[ -f /etc/debian_version ]] || die "This script supports Debian-based systems only."
+    require_vars SCRIPT_USER
+    require_commands apt-get install getent
+    getent passwd "$SCRIPT_USER" >/dev/null || die "Configured user does not exist: $SCRIPT_USER"
+
+    validate_boolean APT_RUN_UPGRADE
+    validate_boolean APT_INSTALL_RECOMMENDS
+    validate_boolean APT_ENABLE_BACKPORTS
+    validate_boolean APT_ENABLE_PROPOSED
+    validate_boolean ALLOW_SSH_LOCKOUT
+
+    [[ $(declare -p PACKAGES_TO_INSTALL 2>/dev/null) == "declare -a"* ]] || die "PACKAGES_TO_INSTALL must be a Bash array."
+    [[ $(declare -p IPTABLES_ALLOW_PORTS 2>/dev/null) == "declare -a"* ]] || die "IPTABLES_ALLOW_PORTS must be a Bash array."
+    [[ $(declare -p SSH_PUBLIC_KEYS 2>/dev/null) == "declare -a"* ]] || die "SSH_PUBLIC_KEYS must be a Bash array."
+}
+
+apt_update() {
+    if $APT_INDEX_REFRESHED; then
+        log "APT package indexes were already refreshed; skipping duplicate update."
+        return 0
+    fi
+    run_logged "Refreshing APT package indexes..." env DEBIAN_FRONTEND=noninteractive apt-get update
+    APT_INDEX_REFRESHED=true
+}
+
+step_apt_sources() {
+    require_vars APT_URL APT_SECURITY_URL DEBIAN_CODENAME APT_COMPONENTS APT_TARGET
+
+    local target_dir staged
+    target_dir=$(dirname -- "$APT_TARGET")
+    mkdir -p -- "$target_dir"
+    staged=$(mktemp "$target_dir/.server-setup-sources.XXXXXX")
+
+    {
+        printf 'deb %s %s %s\n' "$APT_URL" "$DEBIAN_CODENAME" "$APT_COMPONENTS"
+        printf 'deb %s %s-updates %s\n' "$APT_URL" "$DEBIAN_CODENAME" "$APT_COMPONENTS"
+        if is_true "$APT_ENABLE_PROPOSED"; then
+            printf 'deb %s %s-proposed-updates %s\n' "$APT_URL" "$DEBIAN_CODENAME" "$APT_COMPONENTS"
+        fi
+        if is_true "$APT_ENABLE_BACKPORTS"; then
+            printf 'deb %s %s-backports %s\n' "$APT_URL" "$DEBIAN_CODENAME" "$APT_COMPONENTS"
+        fi
+        printf 'deb %s %s-security %s\n' "$APT_SECURITY_URL" "$DEBIAN_CODENAME" "$APT_COMPONENTS"
+    } >"$staged"
+
+    install -o root -g root -m 0644 "$staged" "$APT_TARGET"
+    rm -f -- "$staged"
+    log "APT sources written to $APT_TARGET"
+    apt_update
+    if is_true "$APT_RUN_UPGRADE"; then
+        run_logged "Upgrading installed packages..." env DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+    fi
+}
+
+step_packages() {
+    require_commands debconf-set-selections
+    printf 'iptables-persistent iptables-persistent/autosave_v4 boolean %s\n' "${IPT_PERSISTENT:-true}" | debconf-set-selections
+    printf 'iptables-persistent iptables-persistent/autosave_v6 boolean %s\n' "${IPT_PERSISTENT:-true}" | debconf-set-selections
+
+    apt_update
+    local apt_options=(-y)
+    local packages=("${PACKAGES_TO_INSTALL[@]}" iptables-persistent)
+    local failed_packages=()
+    local index package_name
+    if ! is_true "$APT_INSTALL_RECOMMENDS"; then
+        apt_options+=(--no-install-recommends)
+    fi
+
+    for index in "${!packages[@]}"; do
+        package_name=${packages[$index]}
+        [[ $package_name =~ ^[a-zA-Z0-9][a-zA-Z0-9+.:~-]*$ ]] || die "Invalid APT package name: $package_name"
+        show_subprogress "$((index + 1))" "${#packages[@]}" "Installing $package_name"
+        if ! run_logged "Installing package: $package_name" \
+            env DEBIAN_FRONTEND=noninteractive apt-get install "${apt_options[@]}" "$package_name"; then
+            failed_packages+=("$package_name")
         fi
     done
 
-elif [[ "$RUN_STEP_4" == "N" || "$RUN_STEP_4" == "n" ]]; then
-    echo "Skipping Step 4..."
-else
-    echo "Incorrect option, skipping Step 4..."
-fi
+    if ((${#failed_packages[@]} > 0)); then
+        die "Package installation failed for: ${failed_packages[*]}"
+    fi
+}
 
-printf '\n\n\n'
+step_passwordless_sudo() {
+    require_commands visudo
+    local target_dir staged
+    target_dir=$(dirname -- "$SUDOERS_FILE")
+    mkdir -p -- "$target_dir"
+    staged=$(mktemp "$target_dir/.server-setup-sudoers.XXXXXX")
+    printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$SCRIPT_USER" >"$staged"
+    chmod 0440 "$staged"
+    visudo -cf "$staged" >>"$LOG_FILE" 2>&1 || { rm -f -- "$staged"; die "Generated sudoers configuration is invalid."; }
+    install -o root -g root -m 0440 "$staged" "$SUDOERS_FILE"
+    rm -f -- "$staged"
+    log "Passwordless sudo enabled in $SUDOERS_FILE"
+}
 
-# ****************************** STEP 5 ******************************
-echo "****************************** sshd config hardening ******************************"
-printf '\n'
-read -rp "Do you want to update sshd config ([Y] or N)? " RUN_STEP_5
-RUN_STEP_5=${RUN_STEP_5:-Y}
-
-if [[ "$RUN_STEP_5" == "Y" || "$RUN_STEP_5" == "y" ]]; then
-    cp "$SSHD_CONFIG" "$BACKUP_SSHD"
-    echo "Backup from sshd_config created at $BACKUP_SSHD"
-
-    # Update sshd_config using sed
-    echo "Updating sshd configs..."
-    sed -i "s/^[#[:space:]]*Port.*/Port $PORT/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin $PERMIT_ROOT_LOGIN/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*MaxAuthTries.*/MaxAuthTries $MAX_AUTH_TRIES/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication $PUBKEY_AUTH/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication $PASSWORD_AUTH/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*PermitEmptyPasswords.*/PermitEmptyPasswords $EMPTY_PASS/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication $KBD_INTERACTIVE_AUTH/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*KerberosAuthentication.*/KerberosAuthentication $KERBEROS_AUTH/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*GSSAPIAuthentication.*/GSSAPIAuthentication $GSS_AUTH/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*UsePAM.*/UsePAM $USE_PAM/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*X11Forwarding.*/X11Forwarding $X11_FORWARDING/" "$SSHD_CONFIG"
-    sed -i "s/^[#[:space:]]*PrintMotd.*/PrintMotd $PRINT_MOTD/" "$SSHD_CONFIG"
-
-    # Restart SSH service to apply changes
-    systemctl restart sshd
-    echo "sshd_config updated and service restarted."
-
-elif [[ "$RUN_STEP_5" == "N" || "$RUN_STEP_5" == "n" ]]; then
-    echo "Skipping Step 5..."
-else
-    echo "Incorrect option, skipping Step 5..."
-fi
-
-printf '\n\n\n'
-
-# ****************************** STEP 6 ******************************
-echo "****************************** Set iptables ******************************"
-printf '\n'
-read -rp "Do you want to configure iptables ([Y] or N)? " RUN_STEP_6
-RUN_STEP_6=${RUN_STEP_6:-Y}
-
-if [[ "$RUN_STEP_6" == "Y" || "$RUN_STEP_6" == "y" ]]; then
-    echo "Seting default policies..."
-    iptables -P INPUT $IPTABLES_INPUT
-    iptables -P FORWARD $IPTABLES_FORWARD
-    iptables -P OUTPUT $IPTABLES_OUTPUT
-
-    echo "Allow loopback (localhost)..."
-    iptables -A INPUT -i lo -j ACCEPT
-
-    echo "Allow established/related connections"
-    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    echo "Allow your specific ports"
-    for port in "${IPTABLES_ALLOW_PORTS[@]}" ; do
-        iptables -A INPUT -p tcp --dport $port -j ACCEPT ;
-    done
-
-    echo "Allow SSH port"
-    iptables -A INPUT -p tcp --dport $PORT -j ACCEPT
-
-    echo "Allow ICMP (ping)..."
-    iptables -A INPUT -p icmp -j ACCEPT
-
-    echo "Configuring Docker forwarding rules..."
-    iptables -A FORWARD -i docker0 -o docker0 -j $IPTABLES_DOCKER_FORWARD
-    iptables -A FORWARD -i docker0 ! -o docker0 -j $IPTABLES_DOCKER_FORWARD
-    iptables -A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j $IPTABLES_DOCKER_FORWARD
-
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save
+add_ssh_key() {
+    local key=$1
+    [[ -n $key ]] || return 0
+    if grep -qxF -- "$key" "$AUTH_KEYS"; then
+        log "SSH key already present; skipped."
     else
-        iptables-save > /etc/iptables/rules.v4
-        ip6tables-save > /etc/iptables/rules.v6
+        printf '%s\n' "$key" >>"$AUTH_KEYS"
+        log "SSH key added."
+    fi
+}
+
+step_ssh_keys() {
+    local user_group key
+    user_group=$(id -gn "$SCRIPT_USER")
+    install -d -o "$SCRIPT_USER" -g "$user_group" -m 0700 "$SSH_DIR"
+    if [[ ! -e $AUTH_KEYS ]]; then
+        install -o "$SCRIPT_USER" -g "$user_group" -m 0600 /dev/null "$AUTH_KEYS"
+    else
+        chown "$SCRIPT_USER:$user_group" "$AUTH_KEYS"
+        chmod 0600 "$AUTH_KEYS"
     fi
 
-elif [[ "$RUN_STEP_6" == "N" || "$RUN_STEP_6" == "n" ]]; then
-    echo "Skipping Step 6..."
-else
-    echo "Incorrect option, skipping Step 6..."
-fi
+    for key in "${SSH_PUBLIC_KEYS[@]}"; do
+        add_ssh_key "$key"
+    done
 
-printf '\n\n\n'
+    if ((${#SSH_PUBLIC_KEYS[@]} == 0)); then
+        if [[ -t 0 ]] && ! $NON_INTERACTIVE && ! $ASSUME_YES; then
+            log "Enter SSH public keys one at a time; type 'done' when finished."
+            while true; do
+                read -r -p "SSH public key: " key
+                [[ ${key,,} == done ]] && break
+                add_ssh_key "$key"
+            done
+        else
+            warn "No SSH_PUBLIC_KEYS were configured; authorized_keys was only initialized."
+        fi
+    fi
+}
 
-# ****************************** STEP 7 ******************************
-echo "****************************** Install docker ******************************"
-printf '\n'
-read -rp "Do you want to install Docker ([Y] or N)? " RUN_STEP_7
-RUN_STEP_7=${RUN_STEP_7:-Y}
+set_sshd_option() {
+    local file=$1 name=$2 value=$3
+    local output
+    output=$(mktemp "$(dirname -- "$file")/.server-setup-sshd-option.XXXXXX")
+    awk -v option_name="$name" -v option_value="$value" '
+        BEGIN { in_match = 0; written = 0 }
+        {
+            raw = $0
+            sub(/^[[:space:]]*/, "", raw)
+            uncommented = raw !~ /^#/
+            comparable = raw
+            sub(/^#[[:space:]]*/, "", comparable)
+            split(comparable, fields, /[[:space:]]+/)
 
-if [[ "$RUN_STEP_7" == "Y" || "$RUN_STEP_7" == "y" ]]; then
-    echo "Sourcing Docker install script..."
-    source ./docker-install.sh
-elif [[ "$RUN_STEP_7" == "N" || "$RUN_STEP_7" == "n" ]]; then
-    echo "Skipping Docker installation"
-else
-    echo "Incorrect option, please enter Y(es) or N(o)"
-fi
+            if (uncommented && tolower(fields[1]) == "match") {
+                if (!written) {
+                    print option_name " " option_value
+                    written = 1
+                }
+                in_match = 1
+            }
 
-printf '\n\n\n'
+            if (!in_match && tolower(fields[1]) == tolower(option_name)) {
+                if (!written) {
+                    print option_name " " option_value
+                    written = 1
+                }
+                next
+            }
+            print
+        }
+        END {
+            if (!written) {
+                print option_name " " option_value
+            }
+        }
+    ' "$file" >"$output"
+    mv -- "$output" "$file"
+}
 
-# ****************************** STEP 8 ******************************
-echo "****************************** Disable ip.v6 ******************************"
-printf '\n'
-read -rp "Do you want to disable IP.v6 with sysctl?' ([Y] or N)? " RUN_STEP_8
-RUN_STEP_8=${RUN_STEP_8:-Y}
+step_ssh_hardening() {
+    require_vars PORT PERMIT_ROOT_LOGIN MAX_AUTH_TRIES PUBKEY_AUTH PASSWORD_AUTH EMPTY_PASS \
+        KBD_INTERACTIVE_AUTH KERBEROS_AUTH GSS_AUTH USE_PAM X11_FORWARDING PRINT_MOTD
+    require_commands awk sshd systemctl
+    [[ -f $SSHD_CONFIG ]] || die "SSHD configuration does not exist: $SSHD_CONFIG"
+    [[ $PORT =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || die "PORT must be between 1 and 65535."
+    if [[ ${PASSWORD_AUTH,,} == no ]] && ! is_true "$ALLOW_SSH_LOCKOUT"; then
+        if [[ ! -s $AUTH_KEYS ]] || ! grep -Eq '^[^#[:space:]]' "$AUTH_KEYS"; then
+            die "Password authentication cannot be disabled before adding a public key to $AUTH_KEYS"
+        fi
+    fi
 
-if [[ "$RUN_STEP_8" == "Y" || "$RUN_STEP_8" == "y" ]]; then
-	mkdir -p /etc/sysctl.d
-	touch /etc/sysctl.d/99-disable-ipv6.conf
-	tee -a "/etc/sysctl.d/99-disable-ipv6.conf" > /dev/null << EOF
+    local staged config_mode
+    staged=$(mktemp "$(dirname -- "$SSHD_CONFIG")/.server-setup-sshd.XXXXXX")
+    cp -- "$SSHD_CONFIG" "$staged"
+    set_sshd_option "$staged" Port "$PORT"
+    set_sshd_option "$staged" PermitRootLogin "$PERMIT_ROOT_LOGIN"
+    set_sshd_option "$staged" MaxAuthTries "$MAX_AUTH_TRIES"
+    set_sshd_option "$staged" PubkeyAuthentication "$PUBKEY_AUTH"
+    set_sshd_option "$staged" PasswordAuthentication "$PASSWORD_AUTH"
+    set_sshd_option "$staged" PermitEmptyPasswords "$EMPTY_PASS"
+    set_sshd_option "$staged" KbdInteractiveAuthentication "$KBD_INTERACTIVE_AUTH"
+    set_sshd_option "$staged" KerberosAuthentication "$KERBEROS_AUTH"
+    set_sshd_option "$staged" GSSAPIAuthentication "$GSS_AUTH"
+    set_sshd_option "$staged" UsePAM "$USE_PAM"
+    set_sshd_option "$staged" X11Forwarding "$X11_FORWARDING"
+    set_sshd_option "$staged" PrintMotd "$PRINT_MOTD"
+
+    if ! sshd -t -f "$staged" >>"$LOG_FILE" 2>&1; then
+        rm -f -- "$staged"
+        die "Generated SSH configuration failed validation; the active file was not changed."
+    fi
+
+    cp -a -- "$SSHD_CONFIG" "$BACKUP_SSHD"
+    config_mode=$(stat -c '%a' "$SSHD_CONFIG")
+    install -o root -g root -m "$config_mode" "$staged" "$SSHD_CONFIG"
+    rm -f -- "$staged"
+
+    if systemctl reload ssh >>"$LOG_FILE" 2>&1 || systemctl reload sshd >>"$LOG_FILE" 2>&1; then
+        log "SSHD configuration validated and reloaded; backup: $BACKUP_SSHD"
+    else
+        cp -a -- "$BACKUP_SSHD" "$SSHD_CONFIG"
+        die "Could not reload SSH; the previous configuration was restored."
+    fi
+}
+
+add_iptables_rule() {
+    local chain=$1
+    shift
+    if ! iptables -C "$chain" "$@" >/dev/null 2>&1; then
+        iptables -A "$chain" "$@"
+    fi
+}
+
+step_firewall() {
+    require_vars IPTABLES_INPUT IPTABLES_FORWARD IPTABLES_OUTPUT IPTABLES_DOCKER_FORWARD PORT
+    require_commands iptables iptables-save
+    [[ $IPTABLES_INPUT =~ ^(ACCEPT|DROP)$ ]] || die "IPTABLES_INPUT must be ACCEPT or DROP."
+    [[ $IPTABLES_FORWARD =~ ^(ACCEPT|DROP)$ ]] || die "IPTABLES_FORWARD must be ACCEPT or DROP."
+    [[ $IPTABLES_OUTPUT =~ ^(ACCEPT|DROP)$ ]] || die "IPTABLES_OUTPUT must be ACCEPT or DROP."
+    [[ $IPTABLES_DOCKER_FORWARD =~ ^(ACCEPT|DROP|REJECT)$ ]] || die "Invalid IPTABLES_DOCKER_FORWARD target."
+    local port
+    for port in "$PORT" "${IPTABLES_ALLOW_PORTS[@]}"; do
+        [[ $port =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || die "Invalid TCP port in firewall config: $port"
+    done
+
+    # Install allow rules before restrictive policies to protect the active SSH session.
+    add_iptables_rule INPUT -i lo -j ACCEPT
+    add_iptables_rule INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    add_iptables_rule INPUT -p tcp --dport "$PORT" -j ACCEPT
+    for port in "${IPTABLES_ALLOW_PORTS[@]}"; do
+        [[ $port == "$PORT" ]] || add_iptables_rule INPUT -p tcp --dport "$port" -j ACCEPT
+    done
+    add_iptables_rule INPUT -p icmp -j ACCEPT
+    add_iptables_rule FORWARD -i docker0 -o docker0 -j "$IPTABLES_DOCKER_FORWARD"
+    add_iptables_rule FORWARD -i docker0 ! -o docker0 -j "$IPTABLES_DOCKER_FORWARD"
+    add_iptables_rule FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j "$IPTABLES_DOCKER_FORWARD"
+
+    iptables -P INPUT "$IPTABLES_INPUT"
+    iptables -P FORWARD "$IPTABLES_FORWARD"
+    iptables -P OUTPUT "$IPTABLES_OUTPUT"
+
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        run_logged "Saving firewall rules..." netfilter-persistent save
+    else
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            ip6tables-save > /etc/iptables/rules.v6
+        fi
+    fi
+    log "Firewall configured without duplicating existing managed rules."
+}
+
+step_docker() {
+    [[ -r $SCRIPT_DIR/docker-install.sh ]] || die "Docker installer is missing: $SCRIPT_DIR/docker-install.sh"
+    run_logged "Installing Docker Engine..." env SERVER_SETUP_ENV="$ENV_FILE" bash "$SCRIPT_DIR/docker-install.sh"
+}
+
+step_disable_ipv6() {
+    require_commands sysctl
+    local target=/etc/sysctl.d/99-disable-ipv6.conf
+    local staged
+    staged=$(mktemp /etc/sysctl.d/.server-setup-ipv6.XXXXXX)
+    cat >"$staged" <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-	#apply changes	
-	sysctl --system
+    install -o root -g root -m 0644 "$staged" "$target"
+    rm -f -- "$staged"
+    run_logged "Applying sysctl configuration..." sysctl --system
+    log "IPv6 disable settings written to $target"
+}
 
-elif [[ "$RUN_STEP_8" == "N" || "$RUN_STEP_8" == "n" ]]; then
-    echo "Skipping Step 8..."
-else
-    echo "Incorrect option, skipping Step 8..."
-fi
+step_workspace() {
+    local user_group
+    user_group=$(id -gn "$SCRIPT_USER")
+    install -d -o "$SCRIPT_USER" -g "$user_group" -m "$WORKSPACE_MODE" "$WORKSPACE_DIR"
+    log "Workspace ready at $WORKSPACE_DIR"
+}
 
-printf '\n\n\n'
+validate_config
+log "Debian server setup started for user '$SCRIPT_USER' using $ENV_FILE"
+log "Detailed command output: $LOG_FILE"
 
-# ****************************** STEP 9 ******************************
-echo "****************************** Create workspace directory ******************************"
-printf '\n'
-read -rp "Do you want to create 'workspace' dir ([Y] or N)? " RUN_STEP_9
-RUN_STEP_9=${RUN_STEP_9:-Y}
+run_step "APT sources" "Update the APT source list?" "$STEP_APT_SOURCES_DEFAULT" step_apt_sources
+run_step "Base packages" "Install base packages?" "$STEP_PACKAGES_DEFAULT" step_packages
+run_step "Passwordless sudo" "Enable passwordless sudo for '$SCRIPT_USER'?" "$STEP_PASSWORDLESS_SUDO_DEFAULT" step_passwordless_sudo
+run_step "SSH keys" "Add SSH public keys for '$SCRIPT_USER'?" "$STEP_SSH_KEYS_DEFAULT" step_ssh_keys
+run_step "SSH hardening" "Harden and reload the SSH server configuration?" "$STEP_SSH_HARDENING_DEFAULT" step_ssh_hardening
+run_step "Firewall" "Configure and persist iptables rules?" "$STEP_FIREWALL_DEFAULT" step_firewall
+run_step "Docker" "Install Docker Engine?" "$STEP_DOCKER_DEFAULT" step_docker
+run_step "Disable IPv6" "Disable IPv6 using sysctl?" "$STEP_DISABLE_IPV6_DEFAULT" step_disable_ipv6
+run_step "Workspace" "Create the workspace directory?" "$STEP_WORKSPACE_DEFAULT" step_workspace
 
-if [[ "RUN_STEP_9" == "Y" || "$RUN_STEP_9" == "y" ]]; then
-    [ -d /home/$SCRIPT_USER/workspace ] && echo "workspace directory is exist" || mkdir -p "/home/$SCRIPT_USER/workspace"
-elif [[ "$RUN_STEP_9" == "N" || "$RUN_STEP_9" == "n" ]]; then
-    echo "Skipping Step 9..."
-else
-    echo "Incorrect option, skipping Step 9..."
-fi
-
-printf '\n\n\n'
-
-echo "****************************** Finished ******************************"
-printf '\n'
-
-echo "Are you happy with this script?"
-select HAPPY in Happy Unhappy
-do
-    case $HAPPY in
-        Happy)
-            echo "You're Welcome"
-            ;;
-        Unhappy)
-            echo "Go use another script."
-            ;;
-        *)
-            echo "Idiot! Choose correct option."
-            ;;
-    break
-    esac
-done
+CURRENT_STEP="finished"
+log "Server setup finished in $((SECONDS - START_SECONDS)) seconds."
